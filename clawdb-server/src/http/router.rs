@@ -912,6 +912,13 @@ fn map_error(error: ClawDBError, request_id: Option<String>) -> Response {
             request_id,
             Some(component.to_string()),
         ),
+        other if other.client_error_kind().is_some() => {
+            let status = match other.client_error_kind() {
+                Some(clawdb::error::ClientErrorKind::InvalidArgument) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::CONFLICT,
+            };
+            auth::error_response(status, "invalid_request", Some(other.to_string()), request_id, None)
+        }
         other if other.is_not_found() => auth::error_response(
             StatusCode::NOT_FOUND,
             "not_found",

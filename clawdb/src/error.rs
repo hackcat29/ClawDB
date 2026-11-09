@@ -56,7 +56,37 @@ pub enum ClawDBError {
     Io(#[from] std::io::Error),
 }
 
+/// Errors caused by the request rather than the server. Servers map these to
+/// non-retryable statuses instead of INTERNAL, which clients retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientErrorKind {
+    /// The request itself is malformed (e.g. an invalid branch name).
+    InvalidArgument,
+    /// The thing being created already exists.
+    AlreadyExists,
+    /// The request is valid but the current state doesn't allow it.
+    FailedPrecondition,
+}
+
 impl ClawDBError {
+    /// Classifies errors caused by the caller; `None` for server faults.
+    pub fn client_error_kind(&self) -> Option<ClientErrorKind> {
+        use claw_branch::BranchError as B;
+        match self {
+            Self::Branch(B::InvalidBranchName(_) | B::NamingError(_)) => {
+                Some(ClientErrorKind::InvalidArgument)
+            }
+            Self::Branch(B::BranchAlreadyExists(_)) => Some(ClientErrorKind::AlreadyExists),
+            Self::Branch(
+                B::BranchNotActive { .. }
+                | B::BranchLimitExceeded
+                | B::MergeConflictUnresolved { .. }
+                | B::MergeIncompatibleBase { .. },
+            ) => Some(ClientErrorKind::FailedPrecondition),
+            _ => None,
+        }
+    }
+
     /// True when the error means the referenced thing doesn't exist, from any
     /// component, so servers can answer NOT_FOUND instead of INTERNAL.
     pub fn is_not_found(&self) -> bool {

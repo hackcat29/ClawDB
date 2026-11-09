@@ -104,6 +104,15 @@ impl ClawDbServiceImpl {
                 Status::internal(format!("internal error; request_id={request_id}"))
             }
             other if other.is_not_found() => Status::not_found(other.to_string()),
+            other if other.client_error_kind().is_some() => {
+                use clawdb::error::ClientErrorKind as K;
+                let message = other.to_string();
+                match other.client_error_kind() {
+                    Some(K::InvalidArgument) => Status::invalid_argument(message),
+                    Some(K::AlreadyExists) => Status::already_exists(message),
+                    _ => Status::failed_precondition(message),
+                }
+            }
             other => {
                 tracing::error!(request_id, error = %other, "gRPC handler failed");
                 Status::internal(format!("internal error; request_id={request_id}"))

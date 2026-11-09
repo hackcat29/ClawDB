@@ -42,6 +42,21 @@ impl ClawDbServiceImpl {
         Ok((token, session))
     }
 
+    /// Transactions are bound to the session that opened them: another
+    /// agent holding the tx id must not be able to stage into or commit it.
+    fn check_tx_owner(
+        caller: &ClawDBSession,
+        pending: &crate::state::PendingTransaction,
+    ) -> Result<(), Status> {
+        if caller.agent_id == pending.session.agent_id
+            && caller.workspace_id == pending.session.workspace_id
+        {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("transaction belongs to another session"))
+        }
+    }
+
     fn request_id<T>(request: &Request<T>) -> String {
         request
             .metadata()
@@ -88,6 +103,7 @@ impl ClawDbServiceImpl {
             ClawDBError::Config(_) | ClawDBError::ComponentInit(_, _) => {
                 Status::internal(format!("internal error; request_id={request_id}"))
             }
+            other if other.is_not_found() => Status::not_found(other.to_string()),
             other => {
                 tracing::error!(request_id, error = %other, "gRPC handler failed");
                 Status::internal(format!("internal error; request_id={request_id}"))
@@ -192,10 +208,9 @@ impl ClawDbService for ClawDbServiceImpl {
         request: Request<proto::CreateSessionRequest>,
     ) -> Result<Response<proto::CreateSessionResponse>, Status> {
         let request_id = Self::request_id(&request);
-        if let Err(status) = self.session_from_request(&request).await {
-            self.observe("CreateSession", status.code());
-            return Err(Self::status_with_request_id(status, &request_id));
-        }
+        // Like HTTP POST /v1/sessions, this is how a client gets its first
+        // session, so it can't require one. Requiring it made gRPC-only
+        // clients (the hosted cloud, the SDKs) unable to authenticate at all.
         let inner = request.into_inner();
         let agent_id = match Uuid::parse_str(&inner.agent_id) {
             Ok(agent_id) => agent_id,
@@ -715,13 +730,15 @@ impl ClawDbService for ClawDbServiceImpl {
                 return Err(status);
             }
         };
-        let target = match Uuid::parse_str(&request.get_ref().target) {
+        let target = match self
+            .state
+            .db
+            .resolve_branch(&session, &request.get_ref().target)
+            .await
+        {
             Ok(target) => target,
-            Err(_) => {
-                let status = Self::status_with_request_id(
-                    Status::invalid_argument("invalid target"),
-                    &request_id,
-                );
+            Err(error) => {
+                let status = self.map_error(error, &request_id);
                 self.observe("Merge", status.code());
                 return Err(status);
             }
@@ -1056,13 +1073,15 @@ impl ClawDbService for ClawDbServiceImpl {
                 return Err(status);
             }
         };
-        let target = match Uuid::parse_str(&request.get_ref().target) {
+        let target = match self
+            .state
+            .db
+            .resolve_branch(&session, &request.get_ref().target)
+            .await
+        {
             Ok(target) => target,
-            Err(_) => {
-                let status = Self::status_with_request_id(
-                    Status::invalid_argument("invalid target"),
-                    &request_id,
-                );
+            Err(error) => {
+                let status = self.map_error(error, &request_id);
                 self.observe("Diff", status.code());
                 return Err(status);
             }
@@ -1695,6 +1714,14 @@ impl ClawDbService for ClawDbServiceImpl {
         request: Request<proto::TxRememberRequest>,
     ) -> Result<Response<proto::TxRememberResponse>, Status> {
         let request_id = Self::request_id(&request);
+        let caller = match self.session_from_request(&request).await {
+            Ok((_, session)) => session,
+            Err(status) => {
+                let status = Self::status_with_request_id(status, &request_id);
+                self.observe("TxRemember", status.code());
+                return Err(status);
+            }
+        };
         let inner = request.into_inner();
         let tx_id = match Uuid::parse_str(&inner.tx_id) {
             Ok(tx_id) => tx_id,
@@ -1718,7 +1745,13 @@ impl ClawDbService for ClawDbServiceImpl {
             self.observe("TxRemember", status.code());
             return Err(status);
         };
+        if let Err(status) = Self::check_tx_owner(&caller, pending) {
+            let status = Self::status_with_request_id(status, &request_id);
+            self.observe("TxRemember", status.code());
+            return Err(status);
+        }
         pending.staged_memories.push(StagedMemory {
+            id: staged_id,
             content: inner.content,
             memory_type: "semantic".to_string(),
             tags: Vec::new(),
@@ -1740,6 +1773,14 @@ impl ClawDbService for ClawDbServiceImpl {
         request: Request<proto::TxRememberTypedRequest>,
     ) -> Result<Response<proto::TxRememberResponse>, Status> {
         let request_id = Self::request_id(&request);
+        let caller = match self.session_from_request(&request).await {
+            Ok((_, session)) => session,
+            Err(status) => {
+                let status = Self::status_with_request_id(status, &request_id);
+                self.observe("TxRememberTyped", status.code());
+                return Err(status);
+            }
+        };
         let inner = request.into_inner();
         let tx_id = match Uuid::parse_str(&inner.tx_id) {
             Ok(tx_id) => tx_id,
@@ -1778,7 +1819,13 @@ impl ClawDbService for ClawDbServiceImpl {
             self.observe("TxRememberTyped", status.code());
             return Err(status);
         };
+        if let Err(status) = Self::check_tx_owner(&caller, pending) {
+            let status = Self::status_with_request_id(status, &request_id);
+            self.observe("TxRememberTyped", status.code());
+            return Err(status);
+        }
         pending.staged_memories.push(StagedMemory {
+            id: staged_id,
             content: inner.content,
             memory_type: inner.r#type,
             tags: inner.tags,
@@ -1800,6 +1847,14 @@ impl ClawDbService for ClawDbServiceImpl {
         request: Request<proto::CommitTxRequest>,
     ) -> Result<Response<proto::CommitTxResponse>, Status> {
         let request_id = Self::request_id(&request);
+        let caller = match self.session_from_request(&request).await {
+            Ok((_, session)) => session,
+            Err(status) => {
+                let status = Self::status_with_request_id(status, &request_id);
+                self.observe("CommitTx", status.code());
+                return Err(status);
+            }
+        };
         let tx_id = match Uuid::parse_str(&request.get_ref().tx_id) {
             Ok(tx_id) => tx_id,
             Err(_) => {
@@ -1811,22 +1866,33 @@ impl ClawDbService for ClawDbServiceImpl {
                 return Err(status);
             }
         };
-        let pending = match self.state.transactions.lock().await.remove(&tx_id) {
-            Some(pending) => pending,
-            None => {
-                let status = Self::status_with_request_id(
-                    Status::not_found("transaction not found"),
-                    &request_id,
-                );
-                self.observe("CommitTx", status.code());
-                return Err(status);
+        let pending = {
+            let mut transactions = self.state.transactions.lock().await;
+            match transactions.get(&tx_id) {
+                None => {
+                    let status = Self::status_with_request_id(
+                        Status::not_found("transaction not found"),
+                        &request_id,
+                    );
+                    self.observe("CommitTx", status.code());
+                    return Err(status);
+                }
+                Some(pending) => {
+                    if let Err(status) = Self::check_tx_owner(&caller, pending) {
+                        let status = Self::status_with_request_id(status, &request_id);
+                        self.observe("CommitTx", status.code());
+                        return Err(status);
+                    }
+                }
             }
+            transactions.remove(&tx_id).expect("checked above")
         };
         match self.state.db.transaction(&pending.session).await {
             Ok(mut tx) => {
                 for staged in pending.staged_memories {
                     if let Err(error) = tx
-                        .remember_typed(
+                        .remember_typed_with_id(
+                            Some(staged.id),
                             &staged.content,
                             &staged.memory_type,
                             &staged.tags,
@@ -1868,6 +1934,14 @@ impl ClawDbService for ClawDbServiceImpl {
         request: Request<proto::RollbackTxRequest>,
     ) -> Result<Response<proto::RollbackTxResponse>, Status> {
         let request_id = Self::request_id(&request);
+        let caller = match self.session_from_request(&request).await {
+            Ok((_, session)) => session,
+            Err(status) => {
+                let status = Self::status_with_request_id(status, &request_id);
+                self.observe("RollbackTx", status.code());
+                return Err(status);
+            }
+        };
         let tx_id = match Uuid::parse_str(&request.get_ref().tx_id) {
             Ok(tx_id) => tx_id,
             Err(_) => {
@@ -1879,16 +1953,26 @@ impl ClawDbService for ClawDbServiceImpl {
                 return Err(status);
             }
         };
-        let pending = match self.state.transactions.lock().await.remove(&tx_id) {
-            Some(pending) => pending,
-            None => {
-                let status = Self::status_with_request_id(
-                    Status::not_found("transaction not found"),
-                    &request_id,
-                );
-                self.observe("RollbackTx", status.code());
-                return Err(status);
+        let pending = {
+            let mut transactions = self.state.transactions.lock().await;
+            match transactions.get(&tx_id) {
+                None => {
+                    let status = Self::status_with_request_id(
+                        Status::not_found("transaction not found"),
+                        &request_id,
+                    );
+                    self.observe("RollbackTx", status.code());
+                    return Err(status);
+                }
+                Some(pending) => {
+                    if let Err(status) = Self::check_tx_owner(&caller, pending) {
+                        let status = Self::status_with_request_id(status, &request_id);
+                        self.observe("RollbackTx", status.code());
+                        return Err(status);
+                    }
+                }
             }
+            transactions.remove(&tx_id).expect("checked above")
         };
         match self.state.db.transaction(&pending.session).await {
             Ok(tx) => match tx.rollback().await {

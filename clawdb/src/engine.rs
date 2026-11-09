@@ -444,25 +444,36 @@ impl ClawDB {
                 .map(search_result_to_hit)
                 .collect::<ClawDBResult<Vec<_>>>()?
         } else {
-            self.core
-                .fts_search(query)
-                .await?
-                .into_iter()
-                .filter(|record| {
-                    filter
-                        .as_ref()
-                        .map_or(true, |value| memory_record_matches(record, value))
-                })
-                .take(top_k)
-                .map(|record| SearchHit {
-                    id: record.id,
-                    score: 1.0,
-                    content: record.content,
-                    memory_type: record.memory_type.as_str().to_string(),
-                    tags: record.tags,
-                    metadata: serde_json::Value::Null,
-                })
-                .collect()
+            // Free text is never passed to FTS5 as-is: see crate::fts.
+            let terms = crate::fts::terms(query);
+            match crate::fts::match_expression(&terms) {
+                None => Vec::new(),
+                Some(expression) => {
+                    let mut hits: Vec<SearchHit> = self
+                        .core
+                        .fts_search(&expression)
+                        .await?
+                        .into_iter()
+                        .filter(|record| {
+                            filter
+                                .as_ref()
+                                .map_or(true, |value| memory_record_matches(record, value))
+                        })
+                        .map(|record| SearchHit {
+                            id: record.id,
+                            score: crate::fts::score(&record.content, &terms),
+                            content: record.content,
+                            memory_type: record.memory_type.as_str().to_string(),
+                            tags: record.tags,
+                            metadata: serde_json::Value::Null,
+                        })
+                        .collect();
+                    // Stable sort: equal scores keep FTS's newest-first order.
+                    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+                    hits.truncate(top_k);
+                    hits
+                }
+            }
         };
 
         let mode = if use_semantic { "semantic" } else { "fts" };
@@ -614,6 +625,31 @@ impl ClawDB {
         self.authorize(session, &["branch:read", "branch:*", "*"])
             .await?;
         Ok(self.branch.get_by_name(name).await?)
+    }
+
+    /// Resolves a branch reference: a UUID is used as-is, an empty string or
+    /// `trunk` means the trunk branch, and anything else is looked up by name.
+    pub async fn resolve_branch(
+        &self,
+        session: &ClawDBSession,
+        reference: &str,
+    ) -> ClawDBResult<Uuid> {
+        let reference = reference.trim();
+        if let Ok(id) = Uuid::parse_str(reference) {
+            return Ok(id);
+        }
+        if reference.is_empty() || reference.eq_ignore_ascii_case("trunk") {
+            return Ok(self.trunk_branch(session).await?.id);
+        }
+        // claw-branch reports a missing name as BranchAlreadyExists, so any
+        // lookup failure after authorization is reported as not found.
+        self.authorize(session, &["branch:read", "branch:*", "*"])
+            .await?;
+        self.branch
+            .get_by_name(reference)
+            .await
+            .map(|branch| branch.id)
+            .map_err(|_| ClawDBError::NotFound(format!("branch '{reference}'")))
     }
 
     /// Returns the trunk branch.
@@ -959,6 +995,9 @@ impl ClawDB {
     pub async fn health(&self) -> ClawDBResult<HealthStatus> {
         let mut components = std::collections::HashMap::new();
 
+        // A disabled component reports false (it can't serve requests) but
+        // doesn't count against `ok`, which covers enabled components only.
+        let mut disabled = Vec::new();
         components.insert("core".to_string(), self.core.stats().await.is_ok());
         components.insert(
             "vector".to_string(),
@@ -966,7 +1005,8 @@ impl ClawDB {
                 let _ = vector.stats().await;
                 true
             } else {
-                true
+                disabled.push("vector");
+                false
             },
         );
         components.insert("branch".to_string(), true);
@@ -988,11 +1028,15 @@ impl ClawDB {
                 let _ = reflect;
                 true
             } else {
-                true
+                disabled.push("reflect");
+                false
             },
         );
 
-        let ok = components.values().all(|healthy| *healthy);
+        let ok = components
+            .iter()
+            .filter(|(name, _)| !disabled.contains(&name.as_str()))
+            .all(|(_, healthy)| *healthy);
         Ok(HealthStatus { ok, components })
     }
 
@@ -1066,12 +1110,29 @@ impl<'a> ClawTransaction<'a> {
         tags: &[String],
         metadata: serde_json::Value,
     ) -> ClawDBResult<Uuid> {
-        let record = claw_core::MemoryRecord::new(
+        self.remember_typed_with_id(None, content, memory_type, tags, metadata)
+            .await
+    }
+
+    /// Stages a typed memory under a caller-chosen id, so an id returned to a
+    /// client before commit is the id the memory is stored under.
+    pub async fn remember_typed_with_id(
+        &mut self,
+        id: Option<Uuid>,
+        content: &str,
+        memory_type: &str,
+        tags: &[String],
+        metadata: serde_json::Value,
+    ) -> ClawDBResult<Uuid> {
+        let mut record = claw_core::MemoryRecord::new(
             content,
             parse_memory_type(memory_type),
             tags.to_vec(),
             None,
         );
+        if let Some(id) = id {
+            record.id = id;
+        }
         let id = self.inner.insert_memory(&record).await?;
         self.pending_vector_upserts.push((
             content.to_string(),

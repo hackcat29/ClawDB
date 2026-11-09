@@ -19,6 +19,7 @@ pub mod api;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod fts;
 pub mod lifecycle;
 pub mod plugins;
 pub mod prelude;

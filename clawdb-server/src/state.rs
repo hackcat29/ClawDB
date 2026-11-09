@@ -151,6 +151,8 @@ pub struct PendingTransaction {
 
 #[derive(Clone)]
 pub struct StagedMemory {
+    /// Returned to the client when staged and used as the stored id on commit.
+    pub id: uuid::Uuid,
     pub content: String,
     pub memory_type: String,
     pub tags: Vec<String>,

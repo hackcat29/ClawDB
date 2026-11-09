@@ -76,15 +76,18 @@ struct BranchBody {
 
 #[derive(Deserialize)]
 struct MergeBody {
-    #[serde(alias = "target_id")]
-    target: Uuid,
+    /// Branch id, branch name, or empty/`trunk` for the trunk branch.
+    #[serde(alias = "target_id", default)]
+    target: String,
     #[serde(default)]
     strategy: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct DiffQuery {
-    target: Uuid,
+    /// Branch id, branch name, or empty/`trunk` for the trunk branch.
+    #[serde(default)]
+    target: String,
 }
 
 #[derive(Deserialize)]
@@ -239,7 +242,12 @@ async fn create_session(
             body.agent_id,
             &body.role,
             body.scopes,
-            body.ttl_secs.unwrap_or(3600) as i64,
+            // 0 means "no preference", as on gRPC: an explicit 0 used to
+            // create a session that had already expired.
+            match body.ttl_secs {
+                None | Some(0) => 3600,
+                Some(ttl) => ttl as i64,
+            },
         )
         .await
     {
@@ -461,12 +469,16 @@ async fn merge_branch(
     Path(id): Path<Uuid>,
     Json(body): Json<MergeBody>,
 ) -> Response {
+    let target = match state.db.resolve_branch(&auth.session, &body.target).await {
+        Ok(target) => target,
+        Err(error) => return map_error(error, Some(request_id.0)),
+    };
     match state
         .db
         .merge_with_strategy(
             &auth.session,
             id,
-            body.target,
+            target,
             parse_strategy(body.strategy.as_deref()),
         )
         .await
@@ -483,7 +495,11 @@ async fn diff_branch(
     Path(id): Path<Uuid>,
     Query(query): Query<DiffQuery>,
 ) -> Response {
-    match state.db.diff(&auth.session, id, query.target).await {
+    let target = match state.db.resolve_branch(&auth.session, &query.target).await {
+        Ok(target) => target,
+        Err(error) => return map_error(error, Some(request_id.0)),
+    };
+    match state.db.diff(&auth.session, id, target).await {
         Ok(result) => Json(result).into_response(),
         Err(error) => map_error(error, Some(request_id.0)),
     }
@@ -702,8 +718,30 @@ async fn begin_transaction(
     Json(serde_json::json!({"tx_id": tx_id})).into_response()
 }
 
+/// Same rule as gRPC: only the session that opened a transaction may use it.
+fn tx_owner_error(
+    caller: &clawdb::ClawDBSession,
+    pending: &crate::state::PendingTransaction,
+    request_id: &RequestId,
+) -> Option<Response> {
+    if caller.agent_id == pending.session.agent_id
+        && caller.workspace_id == pending.session.workspace_id
+    {
+        None
+    } else {
+        Some(auth::error_response(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            Some("transaction belongs to another session".to_string()),
+            Some(request_id.0.clone()),
+            None,
+        ))
+    }
+}
+
 async fn tx_remember(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
     Extension(request_id): Extension<RequestId>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateMemoryBody>,
@@ -718,17 +756,23 @@ async fn tx_remember(
             None,
         );
     };
+    if let Some(response) = tx_owner_error(&auth.session, pending, &request_id) {
+        return response;
+    }
+    let memory_id = Uuid::new_v4();
     pending.staged_memories.push(StagedMemory {
+        id: memory_id,
         content: body.content,
         memory_type: "semantic".to_string(),
         tags: Vec::new(),
         metadata: serde_json::Value::Null,
     });
-    Json(serde_json::json!({"staged": true})).into_response()
+    Json(serde_json::json!({"staged": true, "memory_id": memory_id})).into_response()
 }
 
 async fn tx_remember_typed(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
     Extension(request_id): Extension<RequestId>,
     Path(id): Path<Uuid>,
     Json(body): Json<MemoryBody>,
@@ -744,38 +788,53 @@ async fn tx_remember_typed(
             None,
         );
     };
+    if let Some(response) = tx_owner_error(&auth.session, pending, &request_id) {
+        return response;
+    }
+    let memory_id = Uuid::new_v4();
     pending.staged_memories.push(StagedMemory {
+        id: memory_id,
         content: body.content,
         memory_type,
         tags: body.tags,
         metadata: body.metadata,
     });
-    Json(serde_json::json!({"staged": true})).into_response()
+    Json(serde_json::json!({"staged": true, "memory_id": memory_id})).into_response()
 }
 
 async fn commit_transaction(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
     Extension(request_id): Extension<RequestId>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let pending = match state.transactions.lock().await.remove(&id) {
-        Some(pending) => pending,
-        None => {
-            return auth::error_response(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                Some("transaction not found".to_string()),
-                Some(request_id.0),
-                None,
-            );
+    let pending = {
+        let mut transactions = state.transactions.lock().await;
+        match transactions.get(&id) {
+            None => {
+                return auth::error_response(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    Some("transaction not found".to_string()),
+                    Some(request_id.0),
+                    None,
+                );
+            }
+            Some(pending) => {
+                if let Some(response) = tx_owner_error(&auth.session, pending, &request_id) {
+                    return response;
+                }
+            }
         }
+        transactions.remove(&id).expect("checked above")
     };
 
     match state.db.transaction(&pending.session).await {
         Ok(mut tx) => {
             for staged in pending.staged_memories {
                 if let Err(error) = tx
-                    .remember_typed(
+                    .remember_typed_with_id(
+                        Some(staged.id),
                         &staged.content,
                         &staged.memory_type,
                         &staged.tags,
@@ -797,20 +856,29 @@ async fn commit_transaction(
 
 async fn rollback_transaction(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
     Extension(request_id): Extension<RequestId>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let pending = match state.transactions.lock().await.remove(&id) {
-        Some(pending) => pending,
-        None => {
-            return auth::error_response(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                Some("transaction not found".to_string()),
-                Some(request_id.0),
-                None,
-            );
+    let pending = {
+        let mut transactions = state.transactions.lock().await;
+        match transactions.get(&id) {
+            None => {
+                return auth::error_response(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    Some("transaction not found".to_string()),
+                    Some(request_id.0),
+                    None,
+                );
+            }
+            Some(pending) => {
+                if let Some(response) = tx_owner_error(&auth.session, pending, &request_id) {
+                    return response;
+                }
+            }
         }
+        transactions.remove(&id).expect("checked above")
     };
     match state.db.transaction(&pending.session).await {
         Ok(tx) => match tx.rollback().await {
@@ -843,6 +911,13 @@ fn map_error(error: ClawDBError, request_id: Option<String>) -> Response {
             None,
             request_id,
             Some(component.to_string()),
+        ),
+        other if other.is_not_found() => auth::error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            Some(other.to_string()),
+            request_id,
+            None,
         ),
         other => {
             tracing::error!(request_id = ?request_id, error = %other, "HTTP handler failed");

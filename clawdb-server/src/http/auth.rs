@@ -131,12 +131,23 @@ pub async fn rate_limit_middleware(
     next.run(request).await
 }
 
+/// The session token, from `x-claw-session` (the header gRPC clients use, and
+/// the one that survives proxies such as the hosted gateway, which replace
+/// `Authorization` with their own credentials) or `Authorization: Bearer`.
 fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
-        .get(header::AUTHORIZATION)
+        .get("x-claw-session")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn unauthorized() -> Response {

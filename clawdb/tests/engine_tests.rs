@@ -141,7 +141,13 @@ async fn test_health_ok() -> ClawDBResult<()> {
     let (db, _dir) = setup().await?;
     let health = db.health().await?;
     assert!(health.ok);
-    assert!(health.components.values().all(|v| *v));
+    for component in ["core", "branch", "guard", "sync"] {
+        assert_eq!(health.components.get(component), Some(&true), "{component}");
+    }
+    // Not configured in this setup: reported as unavailable, without
+    // failing overall health.
+    assert_eq!(health.components.get("vector"), Some(&false));
+    assert_eq!(health.components.get("reflect"), Some(&false));
     db.close().await
 }
 

@@ -41,6 +41,10 @@ pub enum ClawDBError {
     /// Session invalid or expired.
     #[error("session expired or invalid")]
     SessionInvalid,
+
+    /// A referenced record or branch does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
     /// Transaction error.
     #[error("transaction error: {0}")]
     Transaction(String),
@@ -50,4 +54,17 @@ pub enum ClawDBError {
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl ClawDBError {
+    /// True when the error means the referenced thing doesn't exist, from any
+    /// component, so servers can answer NOT_FOUND instead of INTERNAL.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::NotFound(_) => true,
+            Self::Core(claw_core::ClawError::NotFound { .. }) => true,
+            Self::Branch(error) => error.is_not_found(),
+            _ => false,
+        }
+    }
 }

@@ -938,7 +938,7 @@ impl ClawDB {
             .reflect
             .as_ref()
             .ok_or(ClawDBError::ComponentDisabled("reflect"))?;
-        Ok(reflect.get_facts(agent_id).await?)
+        Ok(empty_if_not_found(reflect.get_facts(agent_id).await)?)
     }
 
     /// Lists reflect jobs.
@@ -989,7 +989,7 @@ impl ClawDB {
             .reflect
             .as_ref()
             .ok_or(ClawDBError::ComponentDisabled("reflect"))?;
-        Ok(reflect.get_preferences(agent_id).await?)
+        Ok(empty_if_not_found(reflect.get_preferences(agent_id).await)?)
     }
 
     /// Returns profile contradictions for an agent.
@@ -1005,7 +1005,7 @@ impl ClawDB {
             .reflect
             .as_ref()
             .ok_or(ClawDBError::ComponentDisabled("reflect"))?;
-        Ok(reflect.get_contradictions(agent_id).await?)
+        Ok(empty_if_not_found(reflect.get_contradictions(agent_id).await)?)
     }
 
     /// Resolves a profile contradiction.
@@ -1324,6 +1324,21 @@ fn memory_record_matches(record: &MemoryRecord, filter: &serde_json::Value) -> b
     metadata_matches(&view, filter)
 }
 
+/// The reflect service answers 404 ("Profile not found") for an agent it has
+/// not reflected on yet. That is "nothing learned so far", not a failure.
+fn empty_if_not_found<T>(
+    result: Result<Vec<T>, claw_reflect_client::ReflectError>,
+) -> Result<Vec<T>, claw_reflect_client::ReflectError> {
+    match result {
+        Err(claw_reflect_client::ReflectError::ApiStatus { status, .. })
+            if status == reqwest::StatusCode::NOT_FOUND =>
+        {
+            Ok(Vec::new())
+        }
+        other => other,
+    }
+}
+
 fn search_result_to_hit(result: claw_vector::SearchResult) -> ClawDBResult<SearchHit> {
     let memory_type = result
         .metadata
@@ -1342,8 +1357,17 @@ fn search_result_to_hit(result: claw_vector::SearchResult) -> ClawDBResult<Searc
                 .collect()
         })
         .unwrap_or_default();
+    // A vector entry has its own id; the memory it indexes is named in its
+    // metadata. Hits must carry the memory's id so recall and delete work on
+    // them and keyword top-ups don't list the same memory twice.
+    let id = result
+        .metadata
+        .get("memory_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or(result.id);
     Ok(SearchHit {
-        id: result.id,
+        id,
         score: result.score,
         content: result.text.unwrap_or_default(),
         memory_type,
@@ -1366,5 +1390,55 @@ fn map_guard_session_error(error: GuardError) -> ClawDBError {
             ClawDBError::SessionInvalid
         }
         other => ClawDBError::Guard(other),
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+
+    fn vector_result(entry_id: Uuid, metadata: serde_json::Value) -> claw_vector::SearchResult {
+        claw_vector::SearchResult {
+            id: entry_id,
+            score: 0.9,
+            vector: None,
+            text: Some("hello".to_string()),
+            metadata,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn hits_carry_the_memory_id_not_the_vector_entry_id() {
+        let entry = Uuid::new_v4();
+        let memory = Uuid::new_v4();
+        let hit = search_result_to_hit(vector_result(
+            entry,
+            serde_json::json!({ "memory_id": memory.to_string(), "memory_type": "context" }),
+        ))
+        .unwrap();
+        assert_eq!(hit.id, memory);
+    }
+
+    #[test]
+    fn hits_fall_back_to_the_entry_id_without_metadata() {
+        let entry = Uuid::new_v4();
+        let hit = search_result_to_hit(vector_result(entry, serde_json::json!({}))).unwrap();
+        assert_eq!(hit.id, entry);
+    }
+
+    #[test]
+    fn reflect_404_means_nothing_learned_yet() {
+        let not_found: Result<Vec<u8>, _> = Err(claw_reflect_client::ReflectError::ApiStatus {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "Profile not found".into(),
+        });
+        assert_eq!(empty_if_not_found(not_found).unwrap(), Vec::<u8>::new());
+
+        let server_error: Result<Vec<u8>, _> = Err(claw_reflect_client::ReflectError::ApiStatus {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "boom".into(),
+        });
+        assert!(empty_if_not_found(server_error).is_err());
     }
 }

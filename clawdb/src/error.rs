@@ -42,6 +42,10 @@ pub enum ClawDBError {
     #[error("session expired or invalid")]
     SessionInvalid,
 
+    /// Sending memories to the reflect service failed.
+    #[error("reflect ingest failed: {0}")]
+    ReflectIngest(String),
+
     /// A referenced record or branch does not exist.
     #[error("not found: {0}")]
     NotFound(String),

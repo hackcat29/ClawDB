@@ -821,9 +821,13 @@ impl ClawDB {
         let Some(reflect) = &self.reflect else {
             return Ok(ReflectSummary::skipped());
         };
-        let job = reflect
-            .trigger_job("full", &session.workspace_id.to_string(), false)
-            .await?;
+        let agent_id = session.workspace_id.to_string();
+        // The reflect service only distils memories it has been sent, and the
+        // client crate has no ingest call: push the newest memories first, or
+        // every job runs on an empty set.
+        let pushed = self.push_memories_to_reflect(&agent_id).await?;
+        tracing::info!(pushed, "sent memories to reflect");
+        let job = reflect.trigger_job("full", &agent_id, false).await?;
         self.emit(ClawEvent::ReflectCycleRun { facts_extracted: 0 })
             .await;
         Ok(ReflectSummary {
@@ -832,6 +836,72 @@ impl ClawDB {
             message: job.message,
             skipped: false,
         })
+    }
+
+    /// Sends the newest memories (up to `REFLECT_PUSH_LIMIT`) to the reflect
+    /// service's ingest route in batches. Returns how many were sent.
+    async fn push_memories_to_reflect(&self, agent_id: &str) -> ClawDBResult<usize> {
+        const REFLECT_PUSH_LIMIT: u32 = 500;
+        const BATCH: usize = 100;
+        const MAX_CONTENT: usize = 65_536;
+        let (Some(base_url), Some(api_key)) =
+            (&self.config.reflect.base_url, &self.config.reflect.api_key)
+        else {
+            return Ok(0);
+        };
+        let page = self
+            .core
+            .list_memories_paginated(
+                None,
+                claw_core::ListOptions {
+                    limit: REFLECT_PUSH_LIMIT,
+                    cursor: None,
+                },
+            )
+            .await?;
+        let url = format!("{}/api/v1/reflect/memories", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let mut sent = 0;
+        for chunk in page.items.chunks(BATCH) {
+            let memories: Vec<serde_json::Value> = chunk
+                .iter()
+                .map(|record| {
+                    let content: String = record.content.chars().take(MAX_CONTENT).collect();
+                    json!({
+                        "id": record.id.to_string(),
+                        "agent_id": agent_id,
+                        "content": content,
+                        "memory_type": record.memory_type.as_str(),
+                        "metadata": {},
+                        "tags": record.tags,
+                        "created_at": record.created_at.to_rfc3339(),
+                        "updated_at": record.updated_at.to_rfc3339(),
+                    })
+                })
+                .collect();
+            let body = json!({
+                "agent_id": agent_id,
+                "memories": memories,
+                "batch_id": Uuid::new_v4().simple().to_string(),
+            });
+            let response = client
+                .post(&url)
+                .header("X-Claw-Api-Key", api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| ClawDBError::ReflectIngest(error.to_string()))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let detail = response.text().await.unwrap_or_default();
+                return Err(ClawDBError::ReflectIngest(format!(
+                    "{status}: {}",
+                    detail.chars().take(300).collect::<String>()
+                )));
+            }
+            sent += chunk.len();
+        }
+        Ok(sent)
     }
 
     /// Returns extracted profile facts for an agent.

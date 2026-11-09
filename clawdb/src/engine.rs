@@ -404,6 +404,39 @@ impl ClawDB {
             .await
     }
 
+    /// Keyword search over SQLite FTS: free text becomes a safe OR query (see
+    /// `crate::fts`), hits are scored by the share of query terms they
+    /// contain, and equal scores keep FTS's newest-first order.
+    async fn keyword_hits(
+        &self,
+        query: &str,
+        top_k: usize,
+        filter: Option<&serde_json::Value>,
+    ) -> ClawDBResult<Vec<SearchHit>> {
+        let terms = crate::fts::terms(query);
+        let Some(expression) = crate::fts::match_expression(&terms) else {
+            return Ok(Vec::new());
+        };
+        let mut hits: Vec<SearchHit> = self
+            .core
+            .fts_search(&expression)
+            .await?
+            .into_iter()
+            .filter(|record| filter.map_or(true, |value| memory_record_matches(record, value)))
+            .map(|record| SearchHit {
+                id: record.id,
+                score: crate::fts::score(&record.content, &terms),
+                content: record.content,
+                memory_type: record.memory_type.as_str().to_string(),
+                tags: record.tags,
+                metadata: serde_json::Value::Null,
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
     /// Searches memory with current component-crate semantics.
     #[tracing::instrument(skip(self, session, query, filter), fields(workspace_id = %session.workspace_id, agent_id = %session.agent_id))]
     pub async fn search_with_options(
@@ -432,48 +465,36 @@ impl ClawDB {
                     top_k.saturating_mul(3).max(top_k),
                 )
                 .await?;
-            if let Some(filter_value) = filter {
+            if let Some(filter_value) = &filter {
                 response
                     .results
-                    .retain(|result| metadata_matches(&result.metadata, &filter_value));
+                    .retain(|result| metadata_matches(&result.metadata, filter_value));
             }
-            response
+            let mut hits = response
                 .results
                 .into_iter()
                 .take(top_k)
                 .map(search_result_to_hit)
-                .collect::<ClawDBResult<Vec<_>>>()?
-        } else {
-            // Free text is never passed to FTS5 as-is: see crate::fts.
-            let terms = crate::fts::terms(query);
-            match crate::fts::match_expression(&terms) {
-                None => Vec::new(),
-                Some(expression) => {
-                    let mut hits: Vec<SearchHit> = self
-                        .core
-                        .fts_search(&expression)
-                        .await?
-                        .into_iter()
-                        .filter(|record| {
-                            filter
-                                .as_ref()
-                                .map_or(true, |value| memory_record_matches(record, value))
-                        })
-                        .map(|record| SearchHit {
-                            id: record.id,
-                            score: crate::fts::score(&record.content, &terms),
-                            content: record.content,
-                            memory_type: record.memory_type.as_str().to_string(),
-                            tags: record.tags,
-                            metadata: serde_json::Value::Null,
-                        })
-                        .collect();
-                    // Stable sort: equal scores keep FTS's newest-first order.
-                    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-                    hits.truncate(top_k);
-                    hits
+                .collect::<ClawDBResult<Vec<_>>>()?;
+            // Memories stored before semantic search was switched on have no
+            // embeddings, so the vector index alone would hide them. Top up
+            // with keyword matches (after the semantic hits, never repeating
+            // one) so turning the feature on can't make old memories vanish.
+            if hits.len() < top_k {
+                let seen: std::collections::HashSet<Uuid> =
+                    hits.iter().map(|hit| hit.id).collect();
+                for hit in self.keyword_hits(query, top_k, filter.as_ref()).await? {
+                    if hits.len() >= top_k {
+                        break;
+                    }
+                    if !seen.contains(&hit.id) {
+                        hits.push(hit);
+                    }
                 }
             }
+            hits
+        } else {
+            self.keyword_hits(query, top_k, filter.as_ref()).await?
         };
 
         let mode = if use_semantic { "semantic" } else { "fts" };

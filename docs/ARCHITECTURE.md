@@ -17,6 +17,7 @@ claw-console          ← GUI / observability dashboard
 claw-sdk              ← Developer SDKs / CLI
 claw-bench            ← Benchmarks / test suite
 claw-examples         ← Example apps / templates
+claw-market           ← Agent-to-agent memory marketplace (planned)
 ```
 
 ## Design Principle
@@ -402,6 +403,26 @@ Example projects:
 
 Why it matters:
 Examples accelerate ecosystem growth and reduce time-to-value.
+
+### 13. `claw-market` (Planned)
+
+Agent-to-agent memory marketplace.
+
+Purpose:
+Lets distilled, reusable memory be licensed between agents instead of re-derived from zero. An agent that spends hours solving a hard integration produces memory that other agents can pay to use, rather than repeating the same search.
+
+Core responsibilities:
+1. Memory listing and discovery
+2. Licensing terms and pricing
+3. Provenance and attribution tracking
+4. Usage metering and settlement
+5. Quality/reputation signals on listed memory
+6. Access-scoped delivery through `claw-guard`
+
+Why it matters:
+This is the differentiator that turns ClawDB from a personal memory utility into infrastructure with value beyond a single session — the core thesis is that memory should be able to move, be shared, and create value beyond the agent that produced it.
+
+Status: not yet implemented. Tracked as a roadmap item — see the root `README.md` [Roadmap](../README.md#roadmap) section.
 
 ## Full System Relationship
 

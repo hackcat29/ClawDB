@@ -737,18 +737,32 @@ impl ClawDbService for ClawDbServiceImpl {
             )
             .await
         {
-            Ok(result) => Ok(self.response_with_request_id(
-                "Merge",
-                Response::new(proto::MergeResponse {
-                    success: result.success,
-                    applied: result.applied,
-                    skipped: result.skipped,
-                    conflicts: result.conflicts.len() as u32,
-                    duration_ms: result.duration_ms,
-                    request_id: request_id.clone(),
-                }),
-                &request_id,
-            )),
+            Ok(result) => {
+                let conflicts_json = match serde_json::to_string(&result.conflicts) {
+                    Ok(conflicts_json) => conflicts_json,
+                    Err(_) => {
+                        let status = Self::status_with_request_id(
+                            Status::internal(format!("internal error; request_id={request_id}")),
+                            &request_id,
+                        );
+                        self.observe("Merge", status.code());
+                        return Err(status);
+                    }
+                };
+                Ok(self.response_with_request_id(
+                    "Merge",
+                    Response::new(proto::MergeResponse {
+                        success: result.success,
+                        applied: result.applied,
+                        skipped: result.skipped,
+                        conflicts: result.conflicts.len() as u32,
+                        duration_ms: result.duration_ms,
+                        request_id: request_id.clone(),
+                        conflicts_json,
+                    }),
+                    &request_id,
+                ))
+            }
             Err(error) => {
                 let status = self.map_error(error, &request_id);
                 self.observe("Merge", status.code());

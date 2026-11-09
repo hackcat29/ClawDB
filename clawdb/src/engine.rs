@@ -404,6 +404,41 @@ impl ClawDB {
             .await
     }
 
+    /// Keeps the candidates whose memory still exists, in order, up to `top_k`,
+    /// and refreshes each from the memory store. The vector index is never
+    /// told about deletes or edits (it can only delete by its own entry id),
+    /// so without this a deleted memory stays searchable and an edited one
+    /// keeps its old text.
+    #[doc(hidden)]
+    pub async fn live_hits(
+        &self,
+        candidates: Vec<SearchHit>,
+        top_k: usize,
+    ) -> ClawDBResult<Vec<SearchHit>> {
+        let mut hits = Vec::with_capacity(top_k.min(candidates.len()));
+        for mut hit in candidates {
+            if hits.len() >= top_k {
+                break;
+            }
+            match self.core.get_memory(hit.id).await {
+                Ok(record) => {
+                    hit.content = record.content;
+                    hit.memory_type = record.memory_type.as_str().to_string();
+                    hit.tags = record.tags;
+                    hits.push(hit);
+                }
+                Err(error) => {
+                    let error = ClawDBError::Core(error);
+                    if error.is_not_found() {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(hits)
+    }
+
     /// Keyword search over SQLite FTS: free text becomes a safe OR query (see
     /// `crate::fts`), hits are scored by the share of query terms they
     /// contain, and equal scores keep FTS's newest-first order.
@@ -470,12 +505,12 @@ impl ClawDB {
                     .results
                     .retain(|result| metadata_matches(&result.metadata, filter_value));
             }
-            let mut hits = response
+            let candidates = response
                 .results
                 .into_iter()
-                .take(top_k)
                 .map(search_result_to_hit)
                 .collect::<ClawDBResult<Vec<_>>>()?;
+            let mut hits = self.live_hits(candidates, top_k).await?;
             // Memories stored before semantic search was switched on have no
             // embeddings, so the vector index alone would hide them. Top up
             // with keyword matches (after the semantic hits, never repeating

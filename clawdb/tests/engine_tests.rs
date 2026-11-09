@@ -168,3 +168,53 @@ async fn test_session_expiry() -> ClawDBResult<()> {
     assert!(matches!(err, ClawDBError::SessionInvalid));
     db.close().await
 }
+
+#[tokio::test]
+async fn test_live_hits_drop_deleted_memories_and_refresh_edits() -> ClawDBResult<()> {
+    use clawdb::SearchHit;
+
+    let (db, _dir) = setup().await?;
+    let session = db
+        .session(
+            Uuid::new_v4(),
+            "assistant",
+            vec!["memory:read".to_string(), "memory:write".to_string()],
+        )
+        .await?;
+    let kept = db.remember(&session, "the original text").await?.memory_id;
+    let deleted = db.remember(&session, "this one gets deleted").await?.memory_id;
+    let edited = db.remember(&session, "before the edit").await?.memory_id;
+    db.delete_memory(&session, deleted).await?;
+    db.update_memory(&session, edited, "after the edit").await?;
+
+    // What a vector index that was never told about the delete or the edit
+    // would hand back: stale text, and an entry for a memory that is gone.
+    let stale = |id: Uuid, content: &str| SearchHit {
+        id,
+        score: 0.9,
+        content: content.to_string(),
+        memory_type: "semantic".to_string(),
+        tags: Vec::new(),
+        metadata: serde_json::Value::Null,
+    };
+    let candidates = vec![
+        stale(deleted, "this one gets deleted"),
+        stale(edited, "before the edit"),
+        stale(Uuid::new_v4(), "never existed"),
+        stale(kept, "the original text"),
+    ];
+
+    let hits = db.live_hits(candidates, 10).await?;
+
+    let ids: Vec<Uuid> = hits.iter().map(|hit| hit.id).collect();
+    assert_eq!(ids, vec![edited, kept], "deleted and unknown memories are dropped, order kept");
+    assert_eq!(hits[0].content, "after the edit", "edited memories show their current text");
+
+    // top_k counts live hits only.
+    let limited = db
+        .live_hits(vec![stale(deleted, "x"), stale(kept, "x"), stale(edited, "x")], 1)
+        .await?;
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].id, kept);
+    db.close().await
+}

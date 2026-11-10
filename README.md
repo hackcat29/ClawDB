@@ -11,6 +11,7 @@
 [![docs.rs](https://img.shields.io/docsrs/clawdb)](https://docs.rs/clawdb)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/hackcat29/ClawDB/blob/main/LICENSE)
 [![CI](https://github.com/hackcat29/ClawDB/actions/workflows/ci.yml/badge.svg)](https://github.com/hackcat29/ClawDB/actions/workflows/ci.yml)
+![Founder School · FS26-2 alumni](https://img.shields.io/badge/Founder%20School-FS26--2%20alumni-111111)
 
 > **ClawDB is the engine behind [Axonio](https://axonio.xyz)**, the hosted memory service for AI agents. The client SDKs (TypeScript, Python, Go, Rust, MCP) are in [hackcat29/axonio-sdk](https://github.com/hackcat29/axonio-sdk). This repository carries the fixes the Axonio cloud runs on: sessions, search, transactions and merge conflicts for cloud clients. Companion engines: [claw-vector](https://github.com/hackcat29/claw-vector) and [claw-reflect](https://github.com/hackcat29/claw-reflect).
 

@@ -9,8 +9,10 @@
 
 [![crates.io](https://img.shields.io/crates/v/clawdb.svg)](https://crates.io/crates/clawdb)
 [![docs.rs](https://img.shields.io/docsrs/clawdb)](https://docs.rs/clawdb)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/Claw-DB/ClawDB/blob/main/LICENSE)
-[![CI](https://github.com/Claw-DB/ClawDB/actions/workflows/ci.yml/badge.svg)](https://github.com/Claw-DB/ClawDB/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/hackcat29/ClawDB/blob/main/LICENSE)
+[![CI](https://github.com/hackcat29/ClawDB/actions/workflows/ci.yml/badge.svg)](https://github.com/hackcat29/ClawDB/actions/workflows/ci.yml)
+
+> **ClawDB is the engine behind [Axonio](https://axonio.xyz)**, the hosted memory service for AI agents. The client SDKs (TypeScript, Python, Go, Rust, MCP) are in [hackcat29/axonio-sdk](https://github.com/hackcat29/axonio-sdk). This repository carries the fixes the Axonio cloud runs on: sessions, search, transactions and merge conflicts for cloud clients. Companion engines: [claw-vector](https://github.com/hackcat29/claw-vector) and [claw-reflect](https://github.com/hackcat29/claw-reflect).
 
 The persistent memory layer AI agents can actually own.
 
